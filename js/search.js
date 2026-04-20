@@ -1,0 +1,332 @@
+(function(){
+  async function fetchIndex(){
+    try{
+      const shards = (typeof window !== 'undefined' && window.SEARCH_SHARDS) || null;
+      if (shards && Object.keys(shards).length){
+        const urls = Object.values(shards).map(u => { try{ return new URL(u, document.baseURI).toString(); }catch(_){ return u; } });
+        const results = await Promise.allSettled(urls.map(u => fetch(u, { credentials: 'same-origin' }).then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })));
+        const docs = [];
+        results.forEach(r => {
+          if (r.status === 'fulfilled'){
+            const arr = Array.isArray(r.value) ? r.value : (r.value && r.value.items) || [];
+            if (Array.isArray(arr)) docs.push(...arr);
+          }
+
+  // 判断是否为英文查询（允许空格/连字符/撇号），用于整词优先
+  function isEnglishLike(q){
+    const s = (q||'').trim();
+    if (s.length < 2) return false;
+    return /^[A-Za-z][A-Za-z0-9'\- ]*$/.test(s);
+  }
+  function escapeRegExp(str){ return str.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+  function wordBoundaryRegex(word){
+    return new RegExp('\\b'+escapeRegExp(word)+'\\b','i');
+  }
+  function findIndices(text, word){
+    const out = []; if (!text||!word) return out;
+    try{
+      const re = new RegExp('\\b'+escapeRegExp(word)+'\\b','ig');
+      let m; while((m = re.exec(text))){ out.push([m.index, m.index + word.length - 1]); if (re.lastIndex === m.index) re.lastIndex++; }
+    }catch(_){}
+    return out;
+  }
+  // 生成“整词优先”的结果；多词时任一词匹配即可（OR），避免过严
+  function wholeWordResults(docs, q){
+    const parts = q.trim().split(/\s+/).filter(w=>w.length>1);
+    if (!parts.length) return [];
+    const res = [];
+    docs.forEach(doc=>{
+      const fields = ['title','description','summary','content','tags','categories'];
+      let matched = false; const matches = [];
+      for (const w of parts){
+        const re = wordBoundaryRegex(w);
+        for (const key of fields){
+          const val = Array.isArray(doc[key]) ? doc[key].join(' ') : (doc[key]||'');
+          if (typeof val !== 'string') continue;
+          if (re.test(val)){
+            matched = true;
+            // 仅对较长字段生成 indices 以便高亮
+            if (key === 'title' || key === 'description' || key === 'summary' || key === 'content'){
+              const idxs = findIndices(val, w);
+              if (idxs.length){ matches.push({ key, indices: idxs }); }
+            }
+          }
+        }
+      }
+      if (matched){ res.push({ item: doc, score: 0.05, matches }); }
+    });
+    return res;
+  }
+        });
+        return docs;
+      }
+      const url = (typeof window !== 'undefined' && window.SEARCH_INDEX_URL) || '/index.json';
+      const res = await fetch(url, { credentials: 'same-origin' });
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const json = await res.json();
+      const items = Array.isArray(json) ? json : (json && json.items) || json;
+      return Array.isArray(items) ? items : [];
+    }catch(err){
+      console.error('Failed to load search index:', err);
+      return [];
+    }
+  }
+
+  // === English whole-word helpers (top-level scope) ===
+  function isEnglishLike(q){
+    const s = (q||'').trim();
+    if (s.length < 2) return false;
+    return /^[A-Za-z][A-Za-z0-9'\- ]*$/.test(s);
+  }
+  function escapeRegExp(str){ return str.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+  function wordBoundaryRegex(word){ return new RegExp('\\b'+escapeRegExp(word)+'\\b','i'); }
+  function findIndices(text, word){
+    const out = []; if (!text||!word) return out;
+    try{
+      const re = new RegExp('\\b'+escapeRegExp(word)+'\\b','ig');
+      let m; while((m = re.exec(text))){ out.push([m.index, m.index + word.length - 1]); if (re.lastIndex === m.index) re.lastIndex++; }
+    }catch(_){/* no-op */}
+    return out;
+  }
+  function wholeWordResults(docs, q){
+    const parts = (q||'').trim().split(/\s+/).filter(w=>w.length>1);
+    if (!parts.length) return [];
+    const res = [];
+    docs.forEach(doc=>{
+      const fields = ['title','description','summary','content','tags','categories'];
+      let matched = false; const matches = [];
+      for (const w of parts){
+        const re = wordBoundaryRegex(w);
+        for (const key of fields){
+          const val = Array.isArray(doc[key]) ? doc[key].join(' ') : (doc[key]||'');
+          if (typeof val !== 'string') continue;
+          if (re.test(val)){
+            matched = true;
+            if (key === 'title' || key === 'description' || key === 'summary' || key === 'content'){
+              const idxs = findIndices(val, w);
+              if (idxs.length){ matches.push({ key, indices: idxs }); }
+            }
+          }
+        }
+      }
+      if (matched){ res.push({ item: doc, score: 0.05, matches }); }
+    });
+    return res;
+  }
+
+  function getQuery(){
+    const q = new URLSearchParams(location.search).get('q') || '';
+    return q.trim();
+  }
+  function buildFuse(docs){
+    if (typeof Fuse === 'undefined') return null;
+    return new Fuse(docs, {
+      includeScore: true,
+      includeMatches: true,
+      threshold: 0.4,           // 稍微放宽，兼容中文单字检索
+      ignoreLocation: true,
+      minMatchCharLength: 1,    // 允许单字匹配（例如“黑”）
+      // 优先 frontmatter（title/description/summary/tags/categories），内容次之
+      keys: [
+        { name: 'title', weight: 0.40 },
+        { name: 'description', weight: 0.30 },
+        { name: 'summary', weight: 0.15 },
+        { name: 'tags', weight: 0.08 },
+        { name: 'categories', weight: 0.05 },
+        { name: 'content', weight: 0.02 }
+      ]
+    });
+  }
+
+  function highlight(text, indices){
+    if (!text || !indices || !indices.length) return text || '';
+    // 合并重叠索引并构造高亮
+    let out = '';
+    let last = 0;
+    indices.forEach(([start, end]) => {
+      if (start > text.length) return;
+      if (start > last) out += text.slice(last, start);
+      out += '<mark>' + text.slice(start, end + 1) + '</mark>';
+      last = end + 1;
+    });
+    out += text.slice(last);
+    return out;
+  }
+
+  function makeSnippets(doc, matches, q){
+    // 生成最多三行简洁片段：优先 description/summary/content，不对 title 生成片段
+    const sourceOrder = ['description', 'summary', 'content'];
+    const snippets = [];
+    const seen = new Set(); // for de-dup
+    const WINDOW = 140; // 每段字符窗口
+
+    // 将 matches 按字段分组
+    const fieldMatches = {};
+    (matches || []).forEach(m => {
+      const key = m.key || (m.refIndex != null ? 'content' : '');
+      if (!key) return;
+      if (!fieldMatches[key]) fieldMatches[key] = [];
+      fieldMatches[key].push(m);
+    });
+
+    for (const field of sourceOrder){
+      if (snippets.length >= 3) break;
+      const text = (doc[field] || '').toString();
+      if (!text) continue;
+      const ms = fieldMatches[field] || [];
+      if (ms.length){
+        let countFromField = 0;
+        // 使用匹配位置截取上下文并高亮
+        for (const m of ms){
+          if (snippets.length >= 3) break;
+          if (countFromField >= 2) break; // 限制每字段最多2条，降低冗余
+          const idx = (m.indices && m.indices[0]) ? m.indices[0][0] : text.toLowerCase().indexOf(q.toLowerCase());
+          const start = Math.max(0, idx - Math.floor(WINDOW/2));
+          const end = Math.min(text.length, start + WINDOW);
+          const slice = text.slice(start, end);
+          // 调整 indices 到切片相对位置
+          const indices = (m.indices || []).map(([s,e])=>[Math.max(0,s-start), Math.min(end-start-1, e-start)]).filter(([s,e])=>s<=e && s < slice.length);
+          const line = (start>0?'…':'') + highlight(slice, indices) + (end<text.length?'…':'');
+          const norm = line.replace(/<[^>]+>/g,'').replace(/\s+/g,' ').trim().toLowerCase();
+          if (!seen.has(norm)){
+            seen.add(norm);
+            snippets.push(line);
+            countFromField++;
+          }
+        }
+      } else if (!matches || !matches.length) {
+        // 无匹配信息：做“展示层”的轻量高亮（不影响检索逻辑）
+        const lower = text.toLowerCase();
+        const qLower = (q || '').toLowerCase();
+        const idx = qLower ? lower.indexOf(qLower) : -1;
+        if (idx >= 0){
+          const start = Math.max(0, idx - Math.floor(WINDOW/2));
+          const end = Math.min(text.length, start + WINDOW);
+          const slice = text.slice(start, end);
+          const relStart = Math.max(0, idx - start);
+          const relEnd = Math.min(slice.length - 1, relStart + qLower.length - 1);
+          const line = (start>0?'…':'') + highlight(slice, [[relStart, relEnd]]) + (end<text.length?'…':'');
+          const norm = line.replace(/<[^>]+>/g,'').replace(/\s+/g,' ').trim().toLowerCase();
+          if (!seen.has(norm)){
+            seen.add(norm);
+            snippets.push(line);
+          }
+        } else {
+          // 仍无命中，回退到起始摘要
+          const cut = text.slice(0, WINDOW);
+          const line = cut + (text.length>WINDOW?'…':'');
+          const norm = line.replace(/<[^>]+>/g,'').replace(/\s+/g,' ').trim().toLowerCase();
+          if (!seen.has(norm)){
+            seen.add(norm);
+            snippets.push(line);
+          }
+        }
+      }
+    }
+    return snippets.slice(0,3);
+  }
+
+  function dedupeByUrl(results){
+    const best = new Map();
+    results.forEach(r => {
+      const doc = r.item || r;
+      const url = doc.url;
+      const score = (typeof r.score === 'number') ? r.score : 1;
+      if (!best.has(url) || score < best.get(url).score){
+        best.set(url, { r, score });
+      }
+    });
+    return Array.from(best.values()).map(x => x.r);
+  }
+
+  function render(results){
+    const box = document.getElementById('results');
+    if(!box) return;
+    if(!results.length){ box.innerHTML = '<p>没有结果。</p>'; return; }
+    const unique = dedupeByUrl(results);
+    box.innerHTML = unique.map(r => {
+      const doc = r.item || r; // fuse result or plain object
+      const date = doc.date ? `<span style="color:var(--muted)">${doc.date}</span>` : '';
+      const meta = `${doc.section||''} ${date}`.trim();
+      const matches = r.matches || [];
+      const q = getQuery();
+      const lines = makeSnippets(doc, matches, q);
+      const snippet = lines.join(' … ');
+      const body = snippet ? `<div class="search-snippet">${snippet}</div>` : '';
+      return `
+        <div class="card" style="margin-bottom:12px;">
+          <a href="${doc.url}" class="card-title">${doc.title}</a>
+          ${body ? `<div class="card-desc">${body}</div>` : ''}
+          ${meta ? `<div style="color:var(--muted);font-size:12px;">${meta}</div>` : ''}
+        </div>`;
+    }).join('');
+  }
+
+  function simpleFilter(docs, q){
+    const s = (q || '').toLowerCase();
+    return docs.filter(d => (
+      (d.title||'').toLowerCase().includes(s) ||
+      (d.description||'').toLowerCase().includes(s) ||
+      (d.summary||'').toLowerCase().includes(s) ||
+      (Array.isArray(d.tags) && d.tags.join(' ').toLowerCase().includes(s)) ||
+      (Array.isArray(d.categories) && d.categories.join(' ').toLowerCase().includes(s)) ||
+      (d.content||'').toLowerCase().includes(s)
+    ));
+  }
+
+  async function init(){
+    const input = document.getElementById('q');
+    const docs = await fetchIndex();
+    const fuse = buildFuse(docs);
+
+    function doSearch(q){
+      if(!q){ render([]); return; }
+      let results = [];
+      if (window.SearchCore){
+        try{
+          const ranked = window.SearchCore.rankAndDedupe(docs, q, { mode: 'all' });
+          results = ranked.slice(0, 50).map(d=>({ item: d, score: 0.01 }));
+          render(results);
+          return;
+        }catch(_){ /* fallthrough */ }
+      }
+      // 核心不可用时的回退：Fuse 模糊 或 简单过滤
+      if (fuse){
+        results = fuse.search(q).slice(0, 50);
+      } else {
+        results = simpleFilter(docs, q).slice(0, 50);
+      }
+      render(results);
+    }
+
+    const initQ = getQuery();
+    if (input){
+      input.value = initQ;
+      input.addEventListener('keydown', (e)=>{
+        if (e.key === 'Enter'){
+          const q = input.value.trim();
+          if (q) {
+            // keep URL in sync
+            const url = new URL(location.href);
+            url.searchParams.set('q', q);
+            history.replaceState(null, '', url.toString());
+          }
+          doSearch(q);
+        }
+      });
+      // Optional live search on input
+      input.addEventListener('input', ()=>{
+        const q = input.value.trim();
+        if (!q) render([]);
+      });
+    }
+
+    if (initQ) doSearch(initQ);
+  }
+
+  if (document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', init);
+  }else{
+    init();
+  }
+})();
